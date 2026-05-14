@@ -162,10 +162,10 @@
   .status-dot.offline { background: var(--red); }
   .status-dot.checking { background: var(--gold); }
 
-  /* ── Plaid ── */
-  .plaid-section { background: var(--navy-lt); border: 1px solid #b5cce3; border-radius: var(--radius); padding: 1.25rem; margin-bottom: 1.25rem; }
-  .plaid-section h3 { font-size: 14px; font-weight: 600; color: var(--navy); margin-bottom: 6px; }
-  .plaid-section p { font-size: 12px; color: var(--muted); margin-bottom: 12px; }
+  /* ── Teller ── */
+  .teller-section { background: var(--navy-lt); border: 1px solid #b5cce3; border-radius: var(--radius); padding: 1.25rem; margin-bottom: 1.25rem; }
+  .teller-section h3 { font-size: 14px; font-weight: 600; color: var(--navy); margin-bottom: 6px; }
+  .teller-section p { font-size: 12px; color: var(--muted); margin-bottom: 12px; }
   .linked-institutions { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 12px; }
   .inst-chip { display: flex; align-items: center; gap: 6px; background: var(--surface); border: 1px solid var(--border); border-radius: 20px; padding: 4px 10px 4px 8px; font-size: 12px; }
   .inst-chip button { background: none; border: none; color: var(--muted); cursor: pointer; font-size: 14px; line-height: 1; padding: 0; }
@@ -242,8 +242,11 @@
 const STORAGE_KEY = 'da_budget_v2';
 const BACKEND_KEY = 'da_budget_backend_url';
 
+const TELLER_APP_KEY = 'da_budget_teller_app_id';
+
 let state = {
   backendUrl: localStorage.getItem(BACKEND_KEY) || '',
+  tellerAppId: localStorage.getItem(TELLER_APP_KEY) || '',
   backendOnline: false,
   currentMonth: '2026-05',
   months: {},
@@ -349,32 +352,42 @@ async function apiDelete(path) {
   return r.json();
 }
 
-// ── Plaid ─────────────────────────────────────────────────────────────────────
-let plaidHandler = null;
-
-async function openPlaidLink() {
+// ── Teller ────────────────────────────────────────────────────────────────────
+async function openTellerConnect() {
   if (!state.backendOnline) {
     alert('Backend is offline. Enter your Railway backend URL in Settings first.');
     return;
   }
-  const { link_token } = await apiPost('/api/create-link-token', {});
-  if (!link_token) { alert('Could not get Plaid link token.'); return; }
+  const appId = state.tellerAppId || (await apiGet('/api/config')).applicationId;
+  if (!appId) {
+    alert('Teller Application ID not configured. Add it in Settings.');
+    return;
+  }
 
-  plaidHandler = Plaid.create({
-    token: link_token,
-    onSuccess: async (public_token, metadata) => {
-      const data = await apiPost('/api/exchange-token', {
-        public_token,
-        institution_name: metadata.institution.name,
+  const teller = TellerConnect.setup({
+    applicationId: appId,
+    onSuccess: async (enrollment) => {
+      const accessToken    = enrollment.accessToken;
+      const enrollmentId   = enrollment.id || enrollment.enrollment?.id || String(Date.now());
+      const institutionName =
+        enrollment.institution?.name ||
+        enrollment.enrollment?.institution?.name ||
+        'Unknown';
+
+      await apiPost('/api/enroll', {
+        enrollment_id: enrollmentId,
+        access_token: accessToken,
+        institution_name: institutionName,
       });
-      state.linkedInstitutions.push({ item_id: data.item_id, name: metadata.institution.name });
+
+      state.linkedInstitutions.push({ enrollment_id: enrollmentId, name: institutionName });
       save();
       await refreshAccounts();
       navigate(state.currentPage);
     },
-    onExit: (err) => { if (err) console.error(err); },
+    onExit: () => {},
   });
-  plaidHandler.open();
+  teller.open();
 }
 
 async function refreshAccounts() {
@@ -389,11 +402,11 @@ async function refreshAccounts() {
   } catch (e) { console.error(e); }
 }
 
-async function unlinkInstitution(itemId) {
+async function unlinkInstitution(enrollmentId) {
   if (!confirm('Unlink this institution?')) return;
-  await apiDelete(`/api/accounts/${itemId}`);
-  state.linkedInstitutions = state.linkedInstitutions.filter(i => i.item_id !== itemId);
-  state.accounts = state.accounts.filter(a => a.item_id !== itemId);
+  await apiDelete(`/api/accounts/${enrollmentId}`);
+  state.linkedInstitutions = state.linkedInstitutions.filter(i => i.enrollment_id !== enrollmentId);
+  state.accounts = state.accounts.filter(a => a.enrollment_id !== enrollmentId);
   save();
   navigate(state.currentPage);
 }
@@ -627,20 +640,20 @@ function accounts() {
   }).join('') : `<div class="empty-state" style="grid-column:1/-1;"><div class="empty-icon">🏦</div><p>No accounts linked yet.<br>Connect your bank below.</p></div>`;
 
   return `
-  <div class="plaid-section">
+  <div class="teller-section">
     <h3>Link a Bank or Credit Card</h3>
-    <p>Connect securely through Plaid. Your credentials go directly to your bank — we never see them.<br>Requires backend URL to be configured in Settings.</p>
+    <p>Connect securely through Teller. Your credentials go directly to your bank — we never see them.<br>Requires backend URL and Teller Application ID to be configured in Settings.</p>
     <div class="linked-institutions" id="inst-chips">
       ${linked.map(i => `
         <div class="inst-chip">
           🏦 ${i.name}
-          <button onclick="unlinkInstitution('${i.item_id}')" aria-label="Unlink ${i.name}">×</button>
+          <button onclick="unlinkInstitution('${i.enrollment_id}')" aria-label="Unlink ${i.name}">×</button>
         </div>`).join('') || '<span style="font-size:12px;color:var(--muted);">No institutions linked</span>'}
     </div>
-    <button class="connect-btn" onclick="openPlaidLink()" ${!state.backendOnline ? 'disabled title="Backend offline — see Settings"' : ''}>
+    <button class="connect-btn" onclick="openTellerConnect()" ${!state.backendOnline ? 'disabled title="Backend offline — see Settings"' : ''}>
       🔗 Connect Account
     </button>
-    ${!state.backendOnline ? `<p style="font-size:11px;color:var(--muted);">⚠️ Backend offline. Add your Railway URL in Settings to enable Plaid.</p>` : ''}
+    ${!state.backendOnline ? `<p style="font-size:11px;color:var(--muted);">⚠️ Backend offline. Add your Railway URL in Settings to enable Teller.</p>` : ''}
   </div>
 
   <div class="accounts-grid">${cards}</div>`;
@@ -722,11 +735,13 @@ function settings() {
   <div class="config-card">
     <h3>Backend Connection</h3>
     <p style="font-size:12px;color:var(--muted);margin-bottom:12px;">
-      Enter your Railway backend URL to enable Plaid bank linking.<br>
+      Enter your Railway backend URL to enable Teller bank linking.<br>
       Status: <span class="status-dot ${dot}"></span><strong>${dotLabel}</strong>
     </p>
     <label>Railway Backend URL</label>
     <input type="url" id="backend-url" value="${state.backendUrl}" placeholder="https://your-app.up.railway.app" />
+    <label>Teller Application ID</label>
+    <input type="text" id="teller-app-id" value="${state.tellerAppId}" placeholder="app_..." style="font-family:'DM Mono',monospace;" />
     <button class="btn-add" onclick="saveBackendUrl()" style="margin:0;">Save &amp; Test Connection</button>
   </div>
 
@@ -742,17 +757,20 @@ function settings() {
       <li>Create a free account at <strong>railway.app</strong></li>
       <li>Create a new project → Deploy from GitHub repo</li>
       <li>Set root directory to <code>server/</code></li>
-      <li>Add environment variables: <code>PLAID_CLIENT_ID</code>, <code>PLAID_SECRET</code>, <code>PLAID_ENV=sandbox</code></li>
+      <li>Add environment variables: <code>TELLER_APP_ID</code>, <code>TELLER_CERT</code>, <code>TELLER_PRIVATE_KEY</code></li>
       <li>Copy the Railway public URL and paste it above</li>
-      <li>Get your Plaid keys free at <strong>dashboard.plaid.com</strong></li>
+      <li>Get your Teller keys at <strong>teller.io/dashboard</strong> — download the cert &amp; private key, then paste their contents (with <code>\\n</code> for newlines) into Railway env vars</li>
     </ol>
   </div>`;
 }
 
 async function saveBackendUrl() {
-  const url = document.getElementById('backend-url').value.trim().replace(/\/$/, '');
-  state.backendUrl = url;
-  localStorage.setItem(BACKEND_KEY, url);
+  const url   = document.getElementById('backend-url').value.trim().replace(/\/$/, '');
+  const appId = document.getElementById('teller-app-id').value.trim();
+  state.backendUrl  = url;
+  state.tellerAppId = appId;
+  localStorage.setItem(BACKEND_KEY,    url);
+  localStorage.setItem(TELLER_APP_KEY, appId);
   await checkBackend();
   navigate('settings');
 }
@@ -898,8 +916,8 @@ load();
 navigate('dashboard');
 </script>
 
-<!-- Plaid Link (loaded async, only needed when backend is configured) -->
-<script src="https://cdn.plaid.com/link/v2/stable/link-initialize.js" async></script>
+<!-- Teller Connect (loaded async, only needed when backend is configured) -->
+<script src="https://cdn.teller.io/connect/connect.js" async></script>
 
 </body>
 </html>
