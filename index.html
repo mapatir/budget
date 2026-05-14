@@ -437,6 +437,70 @@ function changeMonth(val) {
   if (state.currentPage === 'dashboard') navigate('dashboard');
 }
 
+// ── Live Balances card ────────────────────────────────────────────────────────
+function liveBalancesCard() {
+  const accts = state.accounts;
+  if (!accts.length) return '';
+
+  const checking   = accts.filter(a => a.type === 'depository' && a.subtype === 'checking');
+  const savings    = accts.filter(a => a.type === 'depository' && a.subtype === 'savings');
+  const credit     = accts.filter(a => a.type === 'credit');
+  const investment = accts.filter(a => a.type === 'investment');
+  // fall back: any depository not matched above
+  const otherDep   = accts.filter(a => a.type === 'depository' && a.subtype !== 'checking' && a.subtype !== 'savings');
+
+  const balSum = (arr) => arr.reduce((t, a) => {
+    const v = a.type === 'credit'
+      ? (a.balances?.current ?? 0)
+      : (a.balances?.available ?? a.balances?.current ?? 0);
+    return t + v;
+  }, 0);
+
+  const checkingTotal   = balSum(checking) + balSum(otherDep);
+  const savingsTotal    = balSum(savings);
+  const creditTotal     = balSum(credit);
+  const investTotal     = balSum(investment);
+  const netCash         = checkingTotal - creditTotal;
+
+  const balRow = (icon, label, value, colorVar, sublabel = '') => `
+    <div style="display:flex;align-items:center;justify-content:space-between;padding:11px 1.25rem;border-bottom:1px solid var(--border);">
+      <div style="display:flex;align-items:center;gap:10px;">
+        <span style="font-size:18px;width:24px;text-align:center;">${icon}</span>
+        <div>
+          <div style="font-size:13px;font-weight:500;">${label}</div>
+          ${sublabel ? `<div style="font-size:10px;color:var(--muted);">${sublabel}</div>` : ''}
+        </div>
+      </div>
+      <div style="font-size:16px;font-weight:600;font-family:'DM Mono',monospace;color:${colorVar};">${fmt(value)}</div>
+    </div>`;
+
+  const netRow = `
+    <div style="display:flex;align-items:center;justify-content:space-between;padding:11px 1.25rem;border-bottom:1px solid var(--border);background:${netCash >= 0 ? 'var(--green-lt)' : 'var(--red-lt)'};">
+      <div style="display:flex;align-items:center;gap:10px;">
+        <span style="font-size:18px;width:24px;text-align:center;">💵</span>
+        <div style="font-size:13px;font-weight:600;">Net Cash</div>
+      </div>
+      <div style="font-size:16px;font-weight:700;font-family:'DM Mono',monospace;color:${netCash >= 0 ? 'var(--green)' : 'var(--red)'};">${fmt(netCash)}</div>
+    </div>`;
+
+  const refreshBtn = state.backendOnline
+    ? `<button onclick="refreshAccounts().then(()=>navigate('dashboard'))" style="font-size:11px;color:var(--muted);background:none;border:none;cursor:pointer;display:flex;align-items:center;gap:4px;">↻ Refresh</button>`
+    : '';
+
+  return `
+  <div class="chart-card" style="padding:0;overflow:hidden;margin-bottom:1.25rem;">
+    <div style="display:flex;align-items:center;justify-content:space-between;padding:0.75rem 1.25rem;border-bottom:1px solid var(--border);">
+      <div class="chart-title" style="margin:0;">Live Balances</div>
+      ${refreshBtn}
+    </div>
+    ${checking.length || otherDep.length ? balRow('🏦', 'Checking', checkingTotal, 'var(--navy)') : ''}
+    ${credit.length                      ? balRow('💳', 'Card Balance', creditTotal, 'var(--red)', 'current balance owed') : ''}
+    ${(checking.length || otherDep.length) && credit.length ? netRow : ''}
+    ${savings.length                     ? balRow('🐖', 'Savings', savingsTotal, 'var(--teal)') : ''}
+    ${investment.length                  ? balRow('📈', 'Investments', investTotal, 'var(--purple)') : ''}
+  </div>`;
+}
+
 // ── Dashboard ─────────────────────────────────────────────────────────────────
 function dashboard() {
   const m = getMonth();
@@ -469,6 +533,8 @@ function dashboard() {
       <div class="tile-sub">Budget ${fmt(netBud)}</div>
     </div>
   </div>
+
+  ${liveBalancesCard()}
 
   <div class="chart-card">
     <div class="chart-title">Budget vs Actual</div>
