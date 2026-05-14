@@ -1,142 +1,140 @@
 const express = require('express');
 const cors = require('cors');
-const { Configuration, PlaidApi, PlaidEnvironments, Products, CountryCode } = require('plaid');
+const https = require('https');
+const axios = require('axios');
 require('dotenv').config();
 
 const app = express();
 app.use(express.json());
 app.use(cors({ origin: '*' }));
 
-const plaidConfig = new Configuration({
-  basePath: PlaidEnvironments[process.env.PLAID_ENV || 'sandbox'],
-  baseOptions: {
-    headers: {
-      'PLAID-CLIENT-ID': process.env.PLAID_CLIENT_ID,
-      'PLAID-SECRET': process.env.PLAID_SECRET,
-    },
-  },
-});
-const plaidClient = new PlaidApi(plaidConfig);
+// Teller requires mutual TLS — cert & key come from env vars
+const tlsAgent =
+  process.env.TELLER_CERT && process.env.TELLER_PRIVATE_KEY
+    ? new https.Agent({
+        cert: process.env.TELLER_CERT.replace(/\\n/g, '\n'),
+        key: process.env.TELLER_PRIVATE_KEY.replace(/\\n/g, '\n'),
+      })
+    : undefined;
 
-// In-memory store (use a DB like Railway Postgres for production)
-const accessTokens = {};
+const tellerGet = (path, accessToken) =>
+  axios.get(`https://api.teller.io${path}`, {
+    auth: { username: accessToken, password: '' },
+    httpsAgent: tlsAgent,
+  });
+
+// In-memory store: { [enrollmentId]: { accessToken, institutionName } }
+// For production, persist this in Railway Postgres.
+const enrollments = {};
 
 // ── Health check ──────────────────────────────────────────────────────────────
 app.get('/health', (req, res) => res.json({ status: 'ok' }));
 
-// ── Create link token (step 1 of Plaid Link flow) ────────────────────────────
-app.post('/api/create-link-token', async (req, res) => {
-  try {
-    const response = await plaidClient.linkTokenCreate({
-      user: { client_user_id: 'budget-user-1' },
-      client_name: 'D & A Budget',
-      products: [Products.Transactions, Products.Auth],
-      country_codes: [CountryCode.Us],
-      language: 'en',
-    });
-    res.json({ link_token: response.data.link_token });
-  } catch (err) {
-    console.error(err.response?.data || err.message);
-    res.status(500).json({ error: err.response?.data || err.message });
-  }
+// ── Expose Teller application ID to the frontend ──────────────────────────────
+app.get('/api/config', (req, res) => {
+  res.json({ applicationId: process.env.TELLER_APP_ID || '' });
 });
 
-// ── Exchange public token for access token (step 2) ──────────────────────────
-app.post('/api/exchange-token', async (req, res) => {
-  const { public_token, institution_name } = req.body;
-  try {
-    const response = await plaidClient.itemPublicTokenExchange({ public_token });
-    const accessToken = response.data.access_token;
-    const itemId = response.data.item_id;
-    accessTokens[itemId] = { accessToken, institution_name };
-    res.json({ item_id: itemId, institution_name });
-  } catch (err) {
-    console.error(err.response?.data || err.message);
-    res.status(500).json({ error: err.response?.data || err.message });
+// ── Store a new Teller enrollment ─────────────────────────────────────────────
+app.post('/api/enroll', (req, res) => {
+  const { enrollment_id, access_token, institution_name } = req.body;
+  if (!enrollment_id || !access_token) {
+    return res.status(400).json({ error: 'enrollment_id and access_token are required' });
   }
+  enrollments[enrollment_id] = { accessToken: access_token, institutionName: institution_name };
+  res.json({ enrollment_id });
 });
 
 // ── Get all linked accounts ───────────────────────────────────────────────────
 app.get('/api/accounts', async (req, res) => {
   try {
     const allAccounts = [];
-    for (const [itemId, { accessToken, institution_name }] of Object.entries(accessTokens)) {
-      const response = await plaidClient.accountsGet({ access_token: accessToken });
-      const accounts = response.data.accounts.map(a => ({
-        ...a,
-        item_id: itemId,
-        institution_name,
-      }));
-      allAccounts.push(...accounts);
+    for (const [enrollmentId, { accessToken, institutionName }] of Object.entries(enrollments)) {
+      const { data } = await tellerGet('/accounts', accessToken);
+      data.forEach(a =>
+        allAccounts.push({
+          account_id: a.id,
+          name: a.name,
+          type: a.type,
+          subtype: a.subtype,
+          institution_name: institutionName,
+          enrollment_id: enrollmentId,
+        })
+      );
     }
     res.json({ accounts: allAccounts });
   } catch (err) {
     console.error(err.response?.data || err.message);
-    res.status(500).json({ error: err.response?.data || err.message });
+    res.status(500).json({ error: err.message });
   }
 });
 
-// ── Get transactions (last 30 days) ──────────────────────────────────────────
-app.get('/api/transactions', async (req, res) => {
-  const endDate   = new Date().toISOString().split('T')[0];
-  const startDate = new Date(Date.now() - 30 * 864e5).toISOString().split('T')[0];
-  try {
-    const allTransactions = [];
-    for (const [itemId, { accessToken, institution_name }] of Object.entries(accessTokens)) {
-      const response = await plaidClient.transactionsGet({
-        access_token: accessToken,
-        start_date: startDate,
-        end_date: endDate,
-        options: { count: 250 },
-      });
-      const txns = response.data.transactions.map(t => ({ ...t, institution_name }));
-      allTransactions.push(...txns);
-    }
-    allTransactions.sort((a, b) => new Date(b.date) - new Date(a.date));
-    res.json({ transactions: allTransactions });
-  } catch (err) {
-    console.error(err.response?.data || err.message);
-    res.status(500).json({ error: err.response?.data || err.message });
-  }
-});
-
-// ── Get balances ──────────────────────────────────────────────────────────────
+// ── Get balances for all accounts ─────────────────────────────────────────────
 app.get('/api/balances', async (req, res) => {
   try {
     const allBalances = [];
-    for (const [itemId, { accessToken, institution_name }] of Object.entries(accessTokens)) {
-      const response = await plaidClient.accountsBalanceGet({ access_token: accessToken });
-      const accounts = response.data.accounts.map(a => ({
-        account_id: a.account_id,
-        name: a.name,
-        official_name: a.official_name,
-        type: a.type,
-        subtype: a.subtype,
-        balances: a.balances,
-        institution_name,
-      }));
-      allBalances.push(...accounts);
+    for (const [enrollmentId, { accessToken, institutionName }] of Object.entries(enrollments)) {
+      const { data: accounts } = await tellerGet('/accounts', accessToken);
+      for (const account of accounts) {
+        const { data: bal } = await tellerGet(`/accounts/${account.id}/balances`, accessToken);
+        allBalances.push({
+          account_id: account.id,
+          name: account.name,
+          type: account.type,
+          subtype: account.subtype,
+          institution_name: institutionName,
+          enrollment_id: enrollmentId,
+          balances: {
+            available: bal.available != null ? parseFloat(bal.available) : null,
+            current: bal.ledger != null ? parseFloat(bal.ledger) : null,
+          },
+        });
+      }
     }
     res.json({ balances: allBalances });
   } catch (err) {
     console.error(err.response?.data || err.message);
-    res.status(500).json({ error: err.response?.data || err.message });
+    res.status(500).json({ error: err.message });
   }
 });
 
-// ── Remove a linked institution ───────────────────────────────────────────────
-app.delete('/api/accounts/:item_id', async (req, res) => {
-  const { item_id } = req.params;
+// ── Get transactions for all accounts (last 90 days) ─────────────────────────
+app.get('/api/transactions', async (req, res) => {
   try {
-    if (accessTokens[item_id]) {
-      await plaidClient.itemRemove({ access_token: accessTokens[item_id].accessToken });
-      delete accessTokens[item_id];
+    const allTxns = [];
+    for (const [, { accessToken, institutionName }] of Object.entries(enrollments)) {
+      const { data: accounts } = await tellerGet('/accounts', accessToken);
+      for (const account of accounts) {
+        const { data: txns } = await tellerGet(
+          `/accounts/${account.id}/transactions`,
+          accessToken
+        );
+        txns.forEach(t =>
+          allTxns.push({
+            transaction_id: t.id,
+            account_id: account.id,
+            name: t.description,
+            date: t.date,
+            amount: parseFloat(t.amount),
+            category: t.details?.category ? [t.details.category] : [],
+            institution_name: institutionName,
+          })
+        );
+      }
     }
-    res.json({ removed: item_id });
+    allTxns.sort((a, b) => new Date(b.date) - new Date(a.date));
+    res.json({ transactions: allTxns });
   } catch (err) {
     console.error(err.response?.data || err.message);
-    res.status(500).json({ error: err.response?.data || err.message });
+    res.status(500).json({ error: err.message });
   }
+});
+
+// ── Remove a linked enrollment ────────────────────────────────────────────────
+app.delete('/api/accounts/:enrollment_id', (req, res) => {
+  const { enrollment_id } = req.params;
+  delete enrollments[enrollment_id];
+  res.json({ removed: enrollment_id });
 });
 
 const PORT = process.env.PORT || 3001;
