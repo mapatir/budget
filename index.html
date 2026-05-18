@@ -978,8 +978,18 @@ function parseCSV(file) {
 }
 
 // ── Init ──────────────────────────────────────────────────────────────────────
-load();
-navigate('dashboard');
+async function init() {
+  load();
+  navigate('dashboard');
+  if (state.backendUrl && state.linkedInstitutions.length) {
+    await checkBackend();
+    if (state.backendOnline) {
+      await refreshAccounts();
+      if (state.currentPage === 'dashboard') navigate('dashboard');
+    }
+  }
+}
+init();
 </script>
 
 <!-- Teller Connect (loaded async, only needed when backend is configured) -->
